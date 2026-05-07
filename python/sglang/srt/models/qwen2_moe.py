@@ -26,6 +26,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.disaggregation.afd_type import afd_is_active, afd_is_attn, afd_is_ffn
 from sglang.srt.distributed import (
     get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
@@ -435,6 +436,42 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return router_output, shared_output
 
+    def forward_afd(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+    ) -> torch.Tensor:
+        """AFD path: route MoE through the AFD dispatcher.
+
+        - On the FFN role, self.experts is an AFDFFNMoE; calling it blocks on
+          the dispatcher, runs grouped GEMM, and sends the result back. The
+          input hidden_states/topk passed here are placeholders; the real
+          inputs come over the wire.
+        - On the ATTN role, self.experts is an AFDATTNMoE; calling it ships
+          the (hidden_states, topk_output) over the wire to the FFN side and
+          waits for the post-MoE hidden states back.
+        """
+        if afd_is_ffn():
+            self.experts(hidden_states, None)
+            return hidden_states
+
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        router_logits, _ = self.gate(hidden_states)
+        if num_tokens == 0:
+            topk_ids = torch.full(
+                (0, self.topk.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (0, self.topk.top_k), dtype=torch.float32, device=hidden_states.device
+            )
+            topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        else:
+            topk_output = self.topk(hidden_states, router_logits)
+
+        return self.experts(hidden_states, topk_output, forward_batch)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -442,6 +479,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
+        if afd_is_active():
+            return self.forward_afd(hidden_states, forward_batch)
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 

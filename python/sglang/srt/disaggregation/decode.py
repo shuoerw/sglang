@@ -1344,6 +1344,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
+                source_id = self.server_args.disaggregation_source_id
+                if source_id is None:
+                    source_id = 0 if self.server_args.disaggregation_mode == "prefill" else 1
+                self._afd_send_req_to_ffn(source_id)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:

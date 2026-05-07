@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
     release_req_to_metadata_buffer,
 )
+from sglang.srt.disaggregation.afd_type import afd_is_active, afd_is_attn, afd_is_ffn
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
@@ -82,6 +83,7 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
+    AFSyncReq,
     AbortReq,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
@@ -528,6 +530,19 @@ class Scheduler(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
 
+            # AFD: wire up the attn<->ffn ZMQ socket (control plane only).
+            self.afd_send_to_ffn = None
+            self.afd_recv_from_attn = None
+            if port_args.afd_ipc_name is not None and self.tp_rank == 0:
+                if self.server_args.disaggregation_mode in ("prefill", "decode"):
+                    self.afd_send_to_ffn = get_zmq_socket(
+                        context, zmq.PUSH, port_args.afd_ipc_name, False
+                    )
+                elif self.server_args.disaggregation_mode == "expert":
+                    self.afd_recv_from_attn = get_zmq_socket(
+                        context, zmq.PULL, port_args.afd_ipc_name, True
+                    )
+
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
@@ -546,15 +561,15 @@ class Scheduler(
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
 
             if self.server_args.sleep_on_idle:
-                self.idle_sleeper = IdleSleeper(
-                    [
-                        self.recv_from_tokenizer,
-                        self.recv_from_rpc,
-                    ]
-                )
+                idle_socks = [self.recv_from_tokenizer, self.recv_from_rpc]
+                if self.afd_recv_from_attn is not None:
+                    idle_socks.append(self.afd_recv_from_attn)
+                self.idle_sleeper = IdleSleeper(idle_socks)
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
+            self.afd_send_to_ffn = None
+            self.afd_recv_from_attn = None
             self.send_to_tokenizer = SenderWrapper(None)
             self.send_to_detokenizer = SenderWrapper(None)
 
@@ -1466,8 +1481,58 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (AFSyncReq, self.handle_afd_sync),
             ]
         )
+
+    # ---------- AFD ----------
+
+    def handle_afd_sync(self, recv_req):
+        """Expert-side handler: enqueue source_id for the next forward."""
+        if not hasattr(self, "_afd_pending_sources"):
+            self._afd_pending_sources = []
+        self._afd_pending_sources.append(int(recv_req.source_id))
+        return None
+
+    def _afd_send_req_to_ffn(self, source_id):
+        """Attn-side: PUSH an AFSyncReq to the expert pool. Tp_rank 0 only."""
+        sock = getattr(self, "afd_send_to_ffn", None)
+        if sock is None:
+            return
+        sock.send_pyobj(AFSyncReq(source_id=source_id))
+
+    @DynamicGradMode()
+    def event_loop_disagg_expert(self):
+        """AFD expert role main loop.
+
+        Polls ZMQ for AFSyncReq pings from attn ranks. Each ping enqueues a
+        source_id; the loop runs one afd_forward_ffn per pending source, in
+        FIFO order. The actual per-layer transport happens inside the model's
+        forward via the AFD dispatcher.
+
+        Non-AFSyncReq inputs (tokenized generate/embed requests, abort, etc.)
+        are dropped silently — the expert server is not user-facing.
+        """
+        from sglang.srt.disaggregation.afd_dispatcher import get_transport
+
+        while True:
+            recv_reqs = self.recv_requests()
+            # Filter to only the inputs that make sense on the expert role.
+            filtered = [r for r in recv_reqs if isinstance(r, AFSyncReq)]
+            self.process_input_requests(filtered)
+
+            pending = getattr(self, "_afd_pending_sources", None)
+            if pending:
+                while pending:
+                    source_id = pending.pop(0)
+                    if get_transport() is not None and hasattr(
+                        self.tp_worker, "model_runner"
+                    ) and hasattr(self.tp_worker.model_runner, "afd_forward_ffn"):
+                        self.tp_worker.model_runner.afd_forward_ffn(source_id)
+            else:
+                self.maybe_sleep_on_idle()
+
+    # ---------- end AFD ----------
 
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched,
@@ -3837,6 +3902,9 @@ def dispatch_event_loop(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+    if disaggregation_mode == DisaggregationMode.EXPERT:
+        scheduler.event_loop_disagg_expert()
+        return
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()

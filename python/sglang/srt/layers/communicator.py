@@ -20,6 +20,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.disaggregation.afd_type import afd_is_active, afd_is_ffn
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
@@ -439,6 +440,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.afd_role_ffn = afd_is_ffn()
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -504,6 +506,8 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        if self.afd_role_ffn:
+            return hidden_states, residual
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -669,6 +673,8 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        if self.afd_role_ffn:
+            return hidden_states, residual
         if cache is not None:
             self._context.cache = cache
 
@@ -686,6 +692,8 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if self.afd_role_ffn:
+            return hidden_states, residual
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -695,6 +703,8 @@ class LayerCommunicator:
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        if afd_is_active():
+            return False
         if not self.allow_reduce_scatter:
             return False
         if (
@@ -713,6 +723,8 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        if afd_is_active():
+            return False
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at

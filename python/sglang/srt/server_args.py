@@ -725,7 +725,7 @@ class ServerArgs:
     debug_tensor_dump_inject: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
-    disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
+    disaggregation_mode: Literal["null", "prefill", "decode", "expert"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
@@ -734,6 +734,13 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+
+    # AFD (Attention-FFN Disaggregation) — extends PD with a third role: "expert".
+    # When the expert pool is shared by multiple PD pairs, --disaggregation-num-attn-sources
+    # is the capacity (number of arenas) the expert worker allocates.
+    disaggregation_ffn_addr: Optional[str] = None
+    disaggregation_num_attn_sources: int = 2
+    disaggregation_source_id: Optional[int] = None  # Attn-side: arena slot assigned by expert pool. None = derive (0 for prefill, 1 for decode).
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -924,7 +931,7 @@ class ServerArgs:
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
 
     def _handle_load_balance_method(self):
-        if self.disaggregation_mode not in ("null", "prefill", "decode"):
+        if self.disaggregation_mode not in ("null", "prefill", "decode", "expert"):
             raise ValueError(
                 f"Invalid disaggregation_mode={self.disaggregation_mode!r}"
             )
@@ -6408,8 +6415,8 @@ class ServerArgs:
             "--disaggregation-mode",
             type=str,
             default=ServerArgs.disaggregation_mode,
-            choices=["null", "prefill", "decode"],
-            help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+            choices=["null", "prefill", "decode", "expert"],
+            help='Used for PD/AFD disaggregation. "prefill"/"decode" for the attention side of a PD pair (also serves as the AFD attn role). "expert" for the AFD ffn role (a shared expert pool). "null" disables disaggregation.',
         )
         parser.add_argument(
             "--disaggregation-transfer-backend",
@@ -6453,6 +6460,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--disaggregation-ffn-addr",
+            type=str,
+            default=ServerArgs.disaggregation_ffn_addr,
+            help="AFD: bootstrap address (host:port) of the expert pool. Required when --disaggregation-mode is one of {prefill, decode, expert} AND AFD is in use.",
+        )
+        parser.add_argument(
+            "--disaggregation-num-attn-sources",
+            type=int,
+            default=ServerArgs.disaggregation_num_attn_sources,
+            help="AFD: number of attn sources the expert pool is sized for (one arena per source). Default 2 (one prefill + one decode).",
+        )
+        parser.add_argument(
+            "--disaggregation-source-id",
+            type=int,
+            default=ServerArgs.disaggregation_source_id,
+            help="AFD: arena slot id this attn server uses on the expert pool. If unset, defaults to 0 (prefill) or 1 (decode).",
         )
 
         # Encode prefill disaggregation
@@ -7321,6 +7346,9 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # AFD: tcp://host:port that attn ranks PUSH AFSyncReq to and the expert pool PULLs from
+    afd_ipc_name: Optional[str] = None
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -7339,6 +7367,11 @@ class PortArgs:
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
+        afd_ipc_name = None
+        if server_args.disaggregation_mode in ("prefill", "decode", "expert"):
+            if server_args.disaggregation_ffn_addr is not None:
+                afd_ipc_name = f"tcp://{server_args.disaggregation_ffn_addr}"
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -7349,6 +7382,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                afd_ipc_name=afd_ipc_name,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -7400,6 +7434,7 @@ class PortArgs:
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                afd_ipc_name=afd_ipc_name,
             )
 
 

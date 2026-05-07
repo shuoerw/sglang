@@ -797,6 +797,14 @@ class MoriEPMoE(DeepEPMoE):
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+    # AFD branch: when --disaggregation-mode is one of {prefill, decode, expert},
+    # MoE positions are replaced with AFDATTNMoE (attn) or AFDFFNMoE (expert).
+    from sglang.srt.disaggregation.afd_type import afd_is_active, afd_is_attn
+
+    if afd_is_active():
+        from sglang.srt.disaggregation.afd_moe import AFDATTNMoE, AFDFFNMoE
+        return AFDATTNMoE if afd_is_attn() else AFDFFNMoE
+
     # [TODO] kk, temporary solution
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE

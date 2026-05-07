@@ -638,6 +638,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.elastic_ep_backend
             else None
         )
+        # AFD: initialize the wire transport before model construction so
+        # AFDATTNMoE / AFDFFNMoE can resolve their per-layer dispatcher views
+        # during weight loading.
+        if self.server_args.disaggregation_mode in ("prefill", "decode", "expert"):
+            from sglang.srt.disaggregation.afd_dispatcher import init_afd_transport
+            from sglang.srt.disaggregation.afd_type import afd_is_attn
+
+            afd_role = "attn" if afd_is_attn() else "ffn"
+            mode = self.server_args.disaggregation_mode
+            source_id = self.server_args.disaggregation_source_id
+            if afd_role == "attn" and source_id is None:
+                source_id = 0 if mode == "prefill" else 1
+            num_experts = getattr(
+                self.model_config.hf_text_config, "num_experts", 256
+            )
+            init_afd_transport(
+                role=afd_role,
+                num_layers=self.model_config.num_hidden_layers,
+                num_attn_sources=self.server_args.disaggregation_num_attn_sources,
+                hidden_size=self.model_config.hf_text_config.hidden_size,
+                top_k=getattr(self.model_config.hf_text_config, "num_experts_per_tok", 0),
+                num_experts=num_experts,
+                num_max_dispatch_tokens_per_rank=1024,
+                ffn_addr=self.server_args.disaggregation_ffn_addr,
+                source_id=source_id,
+                use_fp8=(self.server_args.quantization == "fp8"),
+            )
+
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -771,7 +799,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
-            self.kernel_warmup()
+            # AFD expert role: no end-user forwards run here directly; warmup
+            # would call model.forward which blocks on the AFD dispatcher.
+            if self.server_args.disaggregation_mode != "expert":
+                self.kernel_warmup()
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
@@ -3210,6 +3241,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         forward_batch.split_index = next_split_index
         return ret
+
+    def afd_forward_ffn(self, source_id: int):
+        """AFD expert role: drive one full forward pass for a given attn source.
+
+        Constructs a minimal idle ForwardBatch (no real input_ids needed; the
+        per-layer hidden states arrive over the wire via the AFD dispatcher).
+        Sets the source_id contextvar so the dispatcher binds to the right
+        arena, then walks the model forward.
+        """
+        import torch
+        from sglang.srt.disaggregation.afd_dispatcher import (
+            set_current_source_id,
+            reset_current_source_id,
+        )
+
+        placeholder_long = torch.zeros(0, dtype=torch.long, device=self.device)
+        placeholder_int = torch.zeros(0, dtype=torch.int32, device=self.device)
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.IDLE,
+            batch_size=0,
+            input_ids=placeholder_long,
+            req_pool_indices=placeholder_int,
+            seq_lens=placeholder_int,
+            out_cache_loc=placeholder_int,
+            seq_lens_sum=0,
+        )
+
+        token = set_current_source_id(source_id)
+        try:
+            self.model.forward(
+                forward_batch.input_ids,
+                None,
+                forward_batch,
+            )
+        finally:
+            reset_current_source_id(token)
 
     def forward(
         self,

@@ -2021,12 +2021,12 @@ def _wait_and_warmup(
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
-    # Send a warmup request
-    if not server_args.skip_server_warmup:
+    # AFD expert role: no end-user request flow goes through this server, so skip warmup.
+    if server_args.skip_server_warmup or server_args.disaggregation_mode == "expert":
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+    else:
         if not execute_warmup_func(server_args):
             return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")

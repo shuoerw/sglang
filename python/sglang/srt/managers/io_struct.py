@@ -2122,4 +2122,16 @@ def _check_all_req_types():
             )
 
 
+
+@dataclass
+class AFSyncReq(BaseReq):
+    """AFD per-batch sync ping from an attn rank to the expert pool.
+
+    `source_id` identifies which attn source is starting a forward pass; the
+    expert pool uses it to bind the per-layer ffn_recv calls to the correct
+    arena (the one assigned to that source at registration time).
+    """
+    source_id: int = 0
+
+
 _check_all_req_types()

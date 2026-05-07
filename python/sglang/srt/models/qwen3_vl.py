@@ -27,6 +27,7 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+from sglang.srt.disaggregation.afd_type import afd_is_ffn
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
@@ -1282,6 +1283,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+
+        if afd_is_ffn():
+            return hidden_states
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
