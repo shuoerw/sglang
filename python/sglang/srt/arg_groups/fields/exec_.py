@@ -865,6 +865,10 @@ class ExecMoe(msgspec.Struct):
         Optional[int],
         "Number of layers to rebalance per forward pass.",
     ] = None
+    eplb_async_rebalance: A[
+        bool,
+        "Overlap CPU placement and Mooncake expert transfers with forward passes; install one prepared layer between passes once every rank is ready.",
+    ] = False
     eplb_min_rebalancing_utilization_threshold: A[
         float,
         "Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
