@@ -948,7 +948,7 @@ class DeepseekV2MoE(nn.Module):
             self.experts.num_local_experts - self.num_fused_shared_experts
         )
 
-        return [
+        weights = [
             x.data[:num_local_experts_for_eplb]
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
@@ -956,6 +956,23 @@ class DeepseekV2MoE(nn.Module):
                 name, x, self.experts.num_local_experts
             )
         ]
+
+        # MegaMoE retains separate UTCCP scale storage alongside the regular
+        # expert parameters. Move those scales with their corresponding weights;
+        # the cached weight tensors themselves alias the registered parameters.
+        for name in ("mega_l1_weights", "mega_l2_weights"):
+            cached = getattr(self.experts, name, None)
+            if cached is not None:
+                scale = cached[1][:num_local_experts_for_eplb]
+                if not any(
+                    tensor.data_ptr() == scale.data_ptr()
+                    and tensor.shape == scale.shape
+                    and tensor.stride() == scale.stride()
+                    and tensor.dtype == scale.dtype
+                    for tensor in weights
+                ):
+                    weights.append(scale)
+        return weights
 
     def _can_dual_stream_graph(self, hidden_states: torch.Tensor) -> bool:
         return (
