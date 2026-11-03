@@ -729,6 +729,8 @@ class DeepseekV2MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
         )
+        # Draft experts keep their own checkpoint placement when target EPLB moves.
+        self.experts.uses_expert_location = not is_nextn
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
