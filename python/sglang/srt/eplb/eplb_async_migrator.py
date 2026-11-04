@@ -156,7 +156,7 @@ class MooncakeExpertTransport(ExpertTransport):
         self._engine = get_mooncake_transfer_engine()
         if self._engine is None:
             raise RuntimeError(
-                "--eplb-async-rebalance moves experts through the Mooncake "
+                "Asynchronous EPLB moves experts through the Mooncake "
                 "transfer engine, which is not initialized in this process."
             )
         self._remote: List[Tuple[str, Dict[int, List[Tuple[int, int]]]]] = []

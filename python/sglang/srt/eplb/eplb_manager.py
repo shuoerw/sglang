@@ -54,13 +54,7 @@ class EPLBManager:
 
         self._async_migrator = None
         self._async_job = None
-        if get_exec().moe.eplb_async_rebalance:
-            from sglang.srt.eplb.eplb_async_migrator import (
-                AsyncExpertMigrator,
-                MooncakeExpertTransport,
-            )
-
-            self._async_migrator = AsyncExpertMigrator(MooncakeExpertTransport())
+        self._init_async_migrator()
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -78,6 +72,47 @@ class EPLBManager:
         )
 
         self._main_generator = self._entrypoint()
+
+    def _init_async_migrator(self):
+        from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+            eplb_async_unavailable_reason,
+            get_mooncake_transfer_engine,
+        )
+        from sglang.srt.distributed.parallel_state import get_world_group
+
+        reason = eplb_async_unavailable_reason()
+        if reason is not None:
+            logger.info("[EPLBManager] synchronous rebalance: %s", reason)
+            return
+
+        engine = get_mooncake_transfer_engine()
+        available = engine is not None and hasattr(
+            engine.engine, "batch_transfer_sync_read"
+        )
+        # A missing package or failed transport on one rank must select the
+        # same path everywhere before asynchronous collectives can begin.
+        ready = torch.tensor([int(available)], dtype=torch.int32)
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=get_world_group().cpu_group)
+        if not ready.item():
+            logger.warning(
+                "[EPLBManager] synchronous rebalance: Mooncake expert reads "
+                "are unavailable on at least one rank"
+            )
+            return
+
+        from sglang.srt.eplb.eplb_async_migrator import (
+            AsyncExpertMigrator,
+            MooncakeExpertTransport,
+        )
+
+        self._async_migrator = AsyncExpertMigrator(MooncakeExpertTransport())
+        logger.info(
+            "[EPLBManager] asynchronous rebalance; install one ready layer per pass"
+        )
+        if self._rebalance_layers_per_chunk is not None:
+            logger.info(
+                "[EPLBManager] layers-per-chunk applies only to synchronous rebalance"
+            )
 
     def on_forward_pass_end(self):
         next(self._main_generator)

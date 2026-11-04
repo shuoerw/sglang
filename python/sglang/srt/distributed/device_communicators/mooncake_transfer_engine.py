@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_exec,
     get_memory,
+    get_parallel,
 )
 from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
@@ -312,12 +314,28 @@ def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
     return _mooncake_transfer_engine
 
 
+def eplb_async_unavailable_reason() -> Optional[str]:
+    """Check the topology and device supported by the async expert transport."""
+    if not get_exec().moe.enable_eplb:
+        return "EPLB is disabled"
+    if get_exec().moe.elastic_ep_backend is not None:
+        return "elastic EP requires its existing expert update path"
+    if get_parallel().ep_size != get_parallel().tp_size:
+        return "async expert transfers require EP size equal to TP size"
+    if get_parallel().pp_size != 1:
+        return "async expert transfers do not support pipeline parallelism"
+    if str(get_device().device).split(":")[0] != "cuda":
+        return "async expert transfers require a CUDA device"
+    return None
+
+
 def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     """
     Need MooncakeTransferEngine when:
     1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
     2) HiCache uses mooncake storage backend
     3) Encoder disaggregation uses mooncake
+    4) Compatible EPLB configurations use asynchronous expert transfers
     """
     use_mooncake_te = (
         (
@@ -342,18 +360,26 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
             and get_exec().moe.elastic_ep_backend is not None
         )
         or get_exec().moe.elastic_ep_backend == "mooncake"
-        or get_exec().moe.eplb_async_rebalance
     )
 
-    if use_mooncake_te:
-        init_mooncake_transfer_engine(
-            hostname=get_local_ip_auto(),
-            gpu_id=gpu_id,
-            ib_device=(
-                get_disagg().disaggregation_ib_device
-                or get_exec().moe.mooncake_ib_device
-            ),
-        )
+    if use_mooncake_te or eplb_async_unavailable_reason() is None:
+        try:
+            init_mooncake_transfer_engine(
+                hostname=get_local_ip_auto(),
+                gpu_id=gpu_id,
+                ib_device=(
+                    get_disagg().disaggregation_ib_device
+                    or get_exec().moe.mooncake_ib_device
+                ),
+            )
+        except (ImportError, OSError, RuntimeError) as error:
+            if use_mooncake_te:
+                raise
+            logger.warning(
+                "Mooncake is unavailable for EPLB; using synchronous rebalance: %s",
+                error,
+            )
+            return
 
         if get_exec().moe.elastic_ep_backend == "mooncake":
             try:
