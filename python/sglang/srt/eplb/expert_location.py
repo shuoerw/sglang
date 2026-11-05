@@ -225,7 +225,6 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def _init_common(model_config: ModelConfig):
-
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
@@ -273,7 +272,6 @@ class ExpertLocationMetadata:
         logical_to_all_physical_map: torch.Tensor,
         moe_ep_rank: Optional[int] = None,
     ):
-
         _, num_physical_experts = physical_to_logical_map.shape
 
         logical_to_all_physical_map_padded = F.pad(
@@ -513,12 +511,10 @@ def _normalize_layer_ids(
 
 
 def get_global_expert_location_metadata():
-
     return get_resources().expert_location_metadata
 
 
 def set_global_expert_location_metadata(value, allow_overwrite=False):
-
     resources = get_resources()
     if not allow_overwrite:
         assert resources.expert_location_metadata is None
@@ -571,7 +567,6 @@ def _compute_logical_to_all_physical_map(
     ep_size: int,
     moe_ep_rank: int,
 ):
-
     # This is rarely called, so we use for loops for maximum clarity
 
     num_layers, num_physical_experts = physical_to_logical_map.shape
@@ -644,7 +639,6 @@ def _pad_nested_array(arr, pad_value):
     return padded
 
 
-# TODO optimize performance (rewrite and/or run in separate process with overlap)
 def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map: torch.Tensor,
     ep_size: int,
@@ -652,7 +646,6 @@ def compute_logical_to_rank_dispatch_physical_map(
     ep_rank: int,
     seed: int = 42,
 ):
-
     r = random.Random(seed)
 
     device = logical_to_all_physical_map.device
@@ -671,41 +664,63 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
 
-    result_list = [
-        [[-1] * num_logical_experts for _ in range(num_layers)] for _ in range(ep_size)
-    ]
+    result_list = [[-1] * num_logical_experts for _ in range(num_layers)]
+    candidates = logical_to_all_physical_map.tolist()
 
     for layer_id in range(num_layers):
         for logical_expert_id in range(num_logical_experts):
-            candidate_physical_expert_ids = _logical_to_all_physical_raw(
-                logical_to_all_physical_map, layer_id, logical_expert_id
-            )
-
-            remaining_ranks = []
-            for moe_ep_rank in range(ep_size):
-                val = _find_nearest_expert(
-                    candidate_physical_expert_ids=candidate_physical_expert_ids,
-                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
-                    moe_ep_rank=moe_ep_rank,
-                    num_gpus_per_node=num_gpus_per_node,
-                    num_local_node_physical_experts=num_local_node_physical_experts,
+            candidate_physical_expert_ids = [
+                p for p in candidates[layer_id][logical_expert_id] if p != -1
+            ]
+            if len(candidate_physical_expert_ids) == 1:
+                result_list[layer_id][logical_expert_id] = (
+                    candidate_physical_expert_ids[0]
                 )
+                continue
 
-                result_list[moe_ep_rank][layer_id][logical_expert_id] = val
-                if val == -1:
-                    remaining_ranks.append(moe_ep_rank)
+            gpu_owner = {}
+            node_owner = {}
+            node_count = {}
+            for physical_id in candidate_physical_expert_ids:
+                gpu_owner.setdefault(
+                    physical_id // num_local_gpu_physical_experts, physical_id
+                )
+                if num_local_node_physical_experts is not None:
+                    node = physical_id // num_local_node_physical_experts
+                    node_owner.setdefault(node, physical_id)
+                    node_count[node] = node_count.get(node, 0) + 1
 
+            # A node is preferred only when it narrows the candidate set.
+            preferred_nodes = {
+                node: node_owner[node]
+                for node, count in node_count.items()
+                if count < len(candidate_physical_expert_ids)
+            }
+            remaining_ranks = [
+                rank
+                for rank in range(ep_size)
+                if rank not in gpu_owner
+                and not (
+                    num_gpus_per_node is not None
+                    and rank // num_gpus_per_node in preferred_nodes
+                )
+            ]
+            choice = gpu_owner.get(ep_rank)
+            if choice is None and num_gpus_per_node is not None:
+                choice = preferred_nodes.get(ep_rank // num_gpus_per_node)
             if remaining_ranks:
                 choices = _fair_choices(
                     candidate_physical_expert_ids, k=len(remaining_ranks), r=r
                 )
-                for moe_ep_rank, choice in zip(remaining_ranks, choices, strict=True):
-                    result_list[moe_ep_rank][layer_id][logical_expert_id] = choice
+                if choice is None:
+                    choice = choices[remaining_ranks.index(ep_rank)]
+            assert choice is not None
+            result_list[layer_id][logical_expert_id] = choice
 
     logical_to_rank_dispatch_physical_map = torch.tensor(result_list, dtype=dtype)
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
 
-    return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
+    return logical_to_rank_dispatch_physical_map.to(device)
 
 
 def _logical_to_all_physical_raw(
