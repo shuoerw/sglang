@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.hierarchical_gloo import try_hierarchical_all_gather
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_INTERNODE_HIER_ALLGATHER = envs.SGLANG_INTERNODE_HIER_ALL_GATHER.get()
 
 # The MLP-sync gather carries each attention-DP group's listener drain state
 # (see DPDrainColumn).
@@ -78,6 +80,10 @@ def exchange_sync_rows(
     world_size = torch.distributed.get_world_size(group)
     if local_row.device.type != "cpu" or world_size <= 2:
         all_gather_single(global_flat, local_row, group=group)
+        return
+    if _INTERNODE_HIER_ALLGATHER and try_hierarchical_all_gather(
+        global_flat, local_row, group
+    ):
         return
     root = torch.distributed.get_global_rank(group, 0)
     rows = global_flat.view(world_size, local_row.numel())

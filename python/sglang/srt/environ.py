@@ -769,6 +769,8 @@ class Envs:
     # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
     SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Opt-in hierarchical Gloo exchange for CPU scheduler batch metadata.
+    SGLANG_INTERNODE_HIER_ALL_GATHER = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
     # Opt-in: retire finished prefill KV transfers while a forward result is pending.
